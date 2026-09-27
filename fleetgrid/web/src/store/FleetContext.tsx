@@ -36,6 +36,13 @@ const REFETCH_EVENTS: ReadonlySet<RealtimeEventType> = new Set<RealtimeEventType
   'driver.updated',
   'shipment.created',
   'shipment.updated',
+  // A broadcast board moves when a request opens, is taken, or loses a driver, and the
+  // driver tab is showing live counts of who is still holding what. Refetch on all three
+  // or the tab quietly shows a stale board.
+  'load_request.opened',
+  'load_request.accepted',
+  'load_request.declined',
+  'load_request.closed',
   'capacity.updated',
   'incident.created',
   'incident.updated',
@@ -136,7 +143,13 @@ export function FleetProvider({ children }: { children: ReactNode }) {
         // and it must not flash the notification id as if it were a shipment id.
         if (message.type === 'notification.created') {
           const n = message.payload as { id?: string; type?: string; message?: string; recipientId?: string };
-          if (n?.id && n.recipientId && n.recipientId === sessionRef.current?.organization?.id) {
+          // A notification is addressed either to an organization (shipper/operator notices)
+      // or to one individual user (a driver being asked to take a load, or told they lost
+      // it). Matching only the organization meant drivers were told about a request they
+      // were part of and saw nothing when they were one.
+      const addressedToMe =
+        n.recipientId === sessionRef.current?.organization?.id || n.recipientId === sessionRef.current?.user.id;
+      if (n?.id && n.recipientId && addressedToMe) {
             pushToast({
               id: n.id,
               type: n.type ?? 'NOTIFICATION',

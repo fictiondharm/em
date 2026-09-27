@@ -9,7 +9,15 @@ import { StatusPill } from '../components/Primitives';
 import { EventFeed } from '../components/EventFeed';
 import { cn, formatMoney, formatT, formatTime } from '../lib/format';
 import { shipmentTone, truckTone } from '../lib/tone';
-import type { CapacityMatch, CapacityOptions, Shipment, ShipmentEvent, SplitLeg } from '../lib/types';
+import type {
+  BoardEntry,
+  CapacityMatch,
+  CapacityOptions,
+  LoadRequestBoard,
+  Shipment,
+  ShipmentEvent,
+  SplitLeg,
+} from '../lib/types';
 
 type Step = 'SEARCH' | 'SELECTED' | 'CONFIRMED';
 
@@ -45,6 +53,16 @@ export function Business() {
 
   const [searching, setSearching] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [broadcasting, setBroadcasting] = useState(false);
+  const [eligiblePreview, setEligiblePreview] = useState<Awaited<
+    ReturnType<typeof api.loadRequestEligible>
+  > | null>(null);
+  const [broadcast, setBroadcast] = useState<{
+    shipment: Shipment;
+    board: LoadRequestBoard;
+    askedCount: number;
+  } | null>(null);
+  const [board, setBoard] = useState<LoadRequestBoard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [delivering, setDelivering] = useState<string | null>(null);
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
@@ -52,6 +70,29 @@ export function Business() {
   const [timeline, setTimeline] = useState<ShipmentEvent[]>([]);
 
   const shipperId = session?.organization?.id ?? snapshot.organizations.find((o) => o.type === 'SHIPPER')?.id ?? '';
+
+  /** Who can take the load in the form, live, so the button can say "5 drivers" before
+   *  anyone commits. The preview never gates the send: the server re-checks eligibility
+   *  on open, so a stale preview can never widen the ask list. */
+  const weightT = Number(weight);
+  useEffect(() => {
+    if (!Number.isFinite(weightT) || weightT <= 0 || origin === destination) {
+      setEligiblePreview(null);
+      return;
+    }
+    let cancelled = false;
+    void api
+      .loadRequestEligible({ origin, destination, weightT })
+      .then((res) => {
+        if (!cancelled) setEligiblePreview(res);
+      })
+      .catch(() => {
+        if (!cancelled) setEligiblePreview(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [origin, destination, weightT]);
   const myShipments = useMemo(
     () => snapshot.shipments.filter((s) => s.shipperId === shipperId).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
     [snapshot.shipments, shipperId],
@@ -202,6 +243,43 @@ export function Business() {
     }
   }
 
+  /**
+   * Open one request to every driver who can take it.
+   *
+   * This reserves nothing. No truck is held and no tonnage is deducted until a driver
+   * accepts, so the shipper gives up the guarantee of a named vehicle and gets speed
+   * plus a real choice of driver instead. The ask list is frozen at open time, which is
+   * what makes the board honest: a driver who was passed by is never silently added later.
+   */
+  async function broadcastRequest() {
+    if (!cargoName.trim()) {
+      setError('Cargo name is required, e.g. "ABC Electronics".');
+      return;
+    }
+    if (!Number.isFinite(weightT) || weightT <= 0) {
+      setError('Weight must be a positive number of tonnes.');
+      return;
+    }
+    setBroadcasting(true);
+    setError(null);
+    try {
+      const res = await api.openLoadRequest({
+        shipperId,
+        cargoName: cargoName.trim(),
+        origin,
+        destination,
+        weightT,
+      });
+      setBroadcast({ shipment: res.shipment, board: res.board, askedCount: res.askedCount });
+      setBoard(res.board);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : (err as Error).message);
+    } finally {
+      setBroadcasting(false);
+    }
+  }
+
   function reset() {
     setStep('SEARCH');
     setSelected(null);
@@ -213,6 +291,8 @@ export function Business() {
     setNearbyNote(null);
     setError(null);
     setDeliveryError(null);
+    setBroadcast(null);
+    setBoard(null);
   }
 
   /**
@@ -337,6 +417,67 @@ export function Business() {
                     {error}
                   </div>
                 )}
+
+                {/* Broadcast is the default path. Reserving a named truck below is the
+                    fallback for when the shipper wants a specific vehicle. */}
+                <div className="mt-4 rounded-md border border-accent/40 bg-accent/[0.06] p-3.5">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="eyebrow text-accent">Or offer it to the whole crew</span>
+                    <span className="text-[10px] text-ink-400">
+                      {eligiblePreview
+                        ? `${eligiblePreview.counts.eligible} of ${
+                            eligiblePreview.counts.eligible + eligiblePreview.counts.rejected
+                          } drivers can take it`
+                        : 'checking who can take this'}
+                    </span>
+                  </div>
+                  <p className="mt-1.5 text-[11px] text-ink-400">
+                    Every driver who can take {weight || '0'}T from {origin} to {destination} gets the request at
+                    the same time. The first one to accept takes the load; the rest are released automatically.
+                    Passing costs nothing and the load stays open for whoever is left.
+                  </p>
+
+                  {eligiblePreview && eligiblePreview.counts.eligible === 0 && (
+                    <div className="mt-2 text-[11px] text-warn">
+                      No driver can take this as one load.{' '}
+                      {options?.split ? 'Use the split option below to place it across several trucks.' : ''}
+                    </div>
+                  )}
+
+                  {broadcast && (
+                    <div className="mt-2.5 rounded border border-healthy/50 bg-healthy/10 px-2.5 py-2 text-[11px] text-healthy">
+                      <span className="font-semibold">{broadcast.shipment.id}</span> is open with{' '}
+                      {broadcast.askedCount} driver{broadcast.askedCount === 1 ? '' : 's'}. Open the Driver tab and
+                      pick any of them to accept or pass.
+                      {board && (
+                        <ul className="mt-1.5 flex flex-wrap gap-1.5">
+                          {board.board.map((e: BoardEntry) => (
+                            <li
+                              key={e.driverId}
+                              className="rounded border border-base-600 px-1.5 py-0.5 text-[9px] text-ink-300"
+                            >
+                              {e.driverName}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      onClick={broadcastRequest}
+                      disabled={broadcasting || !cargoName.trim() || eligiblePreview?.counts.eligible === 0}
+                    >
+                      {broadcasting ? 'Sending…' : 'Send to all eligible drivers'}
+                    </button>
+                    {!cargoName.trim() && (
+                      <span className="text-[10px] text-ink-500">Add a cargo name first.</span>
+                    )}
+                  </div>
+                </div>
 
                 {options?.split && (
                   <div className="mt-4 rounded-md border border-warn/40 bg-warn/[0.07] p-3.5">

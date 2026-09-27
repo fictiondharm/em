@@ -22,6 +22,7 @@ export type TruckStatus =
 
 export type ShipmentStatus =
   | 'DRAFT'
+  | 'AWAITING_DRIVER'
   | 'CAPACITY_RESERVED'
   | 'CONFIRMED'
   | 'IN_TRANSIT'
@@ -105,10 +106,57 @@ export interface Shipment {
   status: ShipmentStatus;
   truckId: string | null;
   capacityOfferId: string | null;
+  /** Broadcast requests: every driver who was asked, frozen when it opened. */
+  askedDriverIds?: string[];
+  /** Broadcast requests: drivers who have passed. The request stays open for the rest. */
+  declinedDriverIds?: string[];
+  closedReason?: string | null;
   price: number;
   currency: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * One driver on a broadcast board. PENDING means they can still act; LOST means the
+ * load was won by someone else before they answered, so the tab must not keep offering
+ * an accept that can no longer succeed.
+ */
+export interface BoardEntry {
+  driverId: string;
+  driverName: string;
+  truckId: string | null;
+  response: 'PENDING' | 'DECLINED' | 'WON' | 'LOST';
+  reason: string | null;
+}
+
+export interface LoadRequestBoard {
+  shipment: Shipment;
+  route: string;
+  open: boolean;
+  winner: { driverId: string; driverName: string; truckId: string } | null;
+  board: BoardEntry[];
+  counts: { asked: number; pending: number; declined: number; lost: number; won: number };
+}
+
+export interface DriverRequests {
+  driver: { id: string; name: string; status: string; assignedTruckId: string | null } | null;
+  truck: Truck | null;
+  open: Array<{ shipment: Shipment; competingDrivers: number }>;
+  won: Shipment[];
+  lost: Array<{ shipment: Shipment; wonBy: string | null }>;
+  counts: { open: number; won: number; lost: number };
+  note: string;
+}
+
+export interface EligibleDriver {
+  driver: { id: string; name: string; status: string };
+  truck: { id: string; origin: string; destination: string; availableT: number };
+  fit: string;
+  freeT: number;
+  pricePerT: number;
+  /** Plain-language reason this driver can or cannot take the load. */
+  note: string;
 }
 
 export interface CapacityOffer {
@@ -293,6 +341,10 @@ export type RealtimeEventType =
   | 'driver.updated'
   | 'shipment.created'
   | 'shipment.updated'
+  | 'load_request.opened'
+  | 'load_request.accepted'
+  | 'load_request.declined'
+  | 'load_request.closed'
   | 'capacity.updated'
   | 'incident.created'
   | 'incident.updated'

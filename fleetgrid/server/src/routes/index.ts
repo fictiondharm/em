@@ -7,6 +7,7 @@ import { eventsRouter } from './events.js';
 import { healthRouter } from './health.js';
 import { incidentsRouter } from './incidents.js';
 import { integrationsRouter } from './integrations.js';
+import { loadRequestsRouter } from './loadRequests.js';
 import { miscRouter } from './misc.js';
 import { recoveryRouter } from './recovery.js';
 import { shipmentsRouter } from './shipments.js';
@@ -21,6 +22,7 @@ export function buildRouter(): Router {
   router.use(trucksRouter);
   router.use(capacityRouter);
   router.use(shipmentsRouter);
+  router.use(loadRequestsRouter);
   router.use(driverRouter);
   router.use(incidentsRouter);
   router.use(recoveryRouter);
@@ -58,6 +60,12 @@ export const ENDPOINT_INDEX = [
   { method: 'GET', path: '/shipments/:id/timeline', purpose: 'Append-only event timeline' },
   { method: 'POST', path: '/shipments/:id/confirm-delivery', purpose: 'IN_TRANSIT → DELIVERED (business confirms receipt)' },
   { method: 'GET', path: '/driver/offers', purpose: 'Driver approval queue: pending offers + accepted loads' },
+  { method: 'POST', path: '/load-requests', purpose: 'Broadcast one request to every eligible driver (first accept wins)' },
+  { method: 'GET', path: '/load-requests/eligible', purpose: 'Preview which drivers could take a lane and weight, and why the others cannot' },
+  { method: 'GET', path: '/load-requests/:id/board', purpose: 'Who got a request, who answered, who won' },
+  { method: 'POST', path: '/load-requests/:id/accept', purpose: 'Take the load; first accept binds the truck, 409 names the winner if beaten' },
+  { method: 'POST', path: '/load-requests/:id/decline', purpose: 'Pass; the request stays open unless you were the last driver holding it' },
+  { method: 'GET', path: '/driver/requests', purpose: 'One driver view of the open board, with how many others are still holding each request' },
   { method: 'GET', path: '/incidents', purpose: 'List incidents' },
   { method: 'POST', path: '/incidents', purpose: 'Report incident (truck → INCIDENT, shipment → AT_RISK)' },
   { method: 'GET', path: '/incidents/:id', purpose: 'Incident detail' },

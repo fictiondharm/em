@@ -35,7 +35,12 @@ export function notificationsFor(
 }
 
 export function toastToneFor(type: string): ToastTone {
-  if (type === 'SHIPMENT_DECCEPTED' || type === 'SHIPMENT_DELIVERED') return 'ok';
+  if (type === 'SHIPMENT_ACCEPTED' || type === 'SHIPMENT_DELIVERED') return 'ok';
+  // You were asked to take a load: worth interrupting for, but it is an opportunity,
+  // not a fault, so it reads as a neutral announcement rather than an alert.
+  if (type === 'LOAD_REQUEST_OPEN') return 'release';
+  // Somebody took it and somebody else did not: both are outcomes to report, not failures.
+  if (type === 'LOAD_REQUEST_TAKEN' || type === 'LOAD_REQUEST_PARTIAL') return 'release';
   if (type === 'SHIPMENT_DECLINED' || type === 'CAPACITY_DECLINED') return 'release';
   if (type.includes('INCIDENT') || type.includes('RISK') || type.includes('RECOVERY')) return 'alert';
   return 'ok';

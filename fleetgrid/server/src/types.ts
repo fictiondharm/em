@@ -25,6 +25,7 @@ export type TruckStatus =
 /** Master PRD §7 — Shipment state machine. (Exactly the states the Master PRD defines.) */
 export type ShipmentStatus =
   | 'DRAFT'
+  | 'AWAITING_DRIVER'
   | 'CAPACITY_RESERVED'
   | 'CONFIRMED'
   | 'IN_TRANSIT'
@@ -121,6 +122,23 @@ export interface Shipment {
   status: ShipmentStatus;
   truckId: string | null;
   capacityOfferId: string | null;
+  /**
+   * Broadcast requests only. Every driver who was asked to carry this load when it
+   * opened, frozen at open time so "who got this request" stays answerable after the
+   * fact instead of shifting as trucks come and go. Empty for a single-truck
+   * reservation, where the driver is implied by `truckId`.
+   *
+   * Optional because a data dir written before broadcast requests existed has no such
+   * field; `POST /demo/reset` rewrites it. Read them as `shipment.askedDriverIds ?? []`.
+   */
+  askedDriverIds?: string[];
+  /**
+   * Broadcast requests only. Drivers who have said no. A decline removes that driver
+   * from the board; it does not close the request while others are still holding it.
+   */
+  declinedDriverIds?: string[];
+  /** Why the last remaining driver declined, when that closed the request. */
+  closedReason?: string | null;
   price: number;
   currency: string;
   createdAt: string;
@@ -230,6 +248,10 @@ export type RealtimeEventType =
   | 'driver.updated'
   | 'shipment.created'
   | 'shipment.updated'
+  | 'load_request.opened'
+  | 'load_request.accepted'
+  | 'load_request.declined'
+  | 'load_request.closed'
   | 'capacity.updated'
   | 'incident.created'
   | 'incident.updated'
@@ -271,7 +293,12 @@ export const TRUCK_TRANSITIONS: Record<TruckStatus, TruckStatus[]> = {
 };
 
 export const SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
-  DRAFT: ['CAPACITY_RESERVED'],
+  // A broadcast request can be opened from DRAFT, or a single-truck reservation can
+  // still go straight to CAPACITY_RESERVED. AWAITING_DRIVER is the open board: many
+  // drivers hold it, the first accept binds a truck and confirms, and it returns to
+  // DRAFT only when the last driver has declined.
+  DRAFT: ['AWAITING_DRIVER', 'CAPACITY_RESERVED'],
+  AWAITING_DRIVER: ['CONFIRMED', 'DRAFT'],
   CAPACITY_RESERVED: ['CONFIRMED', 'AT_RISK'],
   CONFIRMED: ['IN_TRANSIT', 'AT_RISK'],
   IN_TRANSIT: ['AT_RISK', 'DELIVERED'],

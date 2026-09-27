@@ -897,7 +897,221 @@ async function main(): Promise<void> {
     (await api(`/driver/offers?driverId=${newDriverId}`)).body.counts.pending === 1,
     (await api(`/driver/offers?driverId=${newDriverId}`)).body.counts);
 
-  section('16. Reset restores the exact demo state');
+  section('16. A broadcast goes to every eligible driver; first accept wins');
+  await api('/demo/reset', { method: 'POST' });
+
+  const eligibility = await api('/load-requests/eligible?origin=Bengaluru&destination=Chennai&weightT=2');
+  check('Eligibility preview is reachable and returns 200', eligibility.status === 200, eligibility.body);
+  const eligibleIds: string[] = (eligibility.body.eligible ?? []).map((e: any) => e.driver.id);
+  const rejectedIds: string[] = (eligibility.body.rejected ?? []).map((e: any) => e.driver.id);
+  check('Every seeded driver is either eligible or explicitly rejected',
+    eligibleIds.length + rejectedIds.length === 9,
+    { eligible: eligibleIds.length, rejected: rejectedIds.length });
+  check('Several drivers can take a 2T Bengaluru-Chennai load', eligibleIds.length >= 4, eligibleIds);
+  check('Every rejected driver is given a reason, not just filtered out',
+    (eligibility.body.rejected ?? []).every((e: any) => typeof e.note === 'string' && e.note.length > 0),
+    (eligibility.body.rejected ?? []).map((e: any) => ({ id: e.driver.id, note: e.note })));
+
+  const opened = await api('/load-requests', {
+    method: 'POST',
+    body: JSON.stringify({
+      shipperId,
+      cargoName: 'Broadcast Test Electronics',
+      origin: 'Bengaluru',
+      destination: 'Chennai',
+      weightT: 2,
+    }),
+  });
+  check('POST /load-requests opens a request', opened.status === 201 || opened.status === 200, opened.body);
+  const reqId: string = opened.body.shipment.id;
+  check('It lands in AWAITING_DRIVER, not reserved',
+    opened.body.shipment.status === 'AWAITING_DRIVER', opened.body.shipment.status);
+  check('No truck is bound and no tonnage is held at open time',
+    opened.body.shipment.truckId === null && opened.body.shipment.capacityOfferId === null,
+    { truckId: opened.body.shipment.truckId, offer: opened.body.shipment.capacityOfferId });
+  check('The ask list is every eligible driver, frozen at open time',
+    opened.body.askedCount === eligibleIds.length &&
+      [...(opened.body.shipment.askedDriverIds ?? [])].sort().join(',') === [...eligibleIds].sort().join(','),
+    { asked: opened.body.askedCount, eligible: eligibleIds.length });
+  check('Nobody is declined yet', (opened.body.shipment.declinedDriverIds ?? []).length === 0);
+  // Notifications are addressed to a driver's user, not their driver row, because one
+  // organization holds the whole fleet. Resolve the id so this asserts the right thing.
+  const driversState: any[] = (await api('/state')).body.drivers;
+  const userIdOf = (driverId: string) => driversState.find((d: any) => d.id === driverId)?.userId;
+  const firstAskedUserId = userIdOf(eligibleIds[0]);
+  check('Every asked driver has a user to notify', typeof firstAskedUserId === 'string', firstAskedUserId);
+  check('The opening is announced to exactly the drivers who were asked',
+    (await api('/state')).body.notifications.filter(
+      (n: any) => n.type === 'LOAD_REQUEST_OPEN' && n.recipientId === firstAskedUserId,
+    ).length === 1,
+    'each asked driver should get one LOAD_REQUEST_OPEN, addressed to their user');
+
+  // Every asked driver sees it, and knows how many others hold it.
+  const firstDriverView = await api(`/driver/requests?driverId=${eligibleIds[0]}`);
+  check('An asked driver sees the request as open', firstDriverView.body.counts.open === 1, firstDriverView.body.counts);
+  check('They are told how many other drivers hold it',
+    firstDriverView.body.open[0]?.competingDrivers === eligibleIds.length - 1,
+    { competing: firstDriverView.body.open[0]?.competingDrivers, expected: eligibleIds.length - 1 });
+  const secondDriverView = await api(`/driver/requests?driverId=${eligibleIds[1]}`);
+  check('A second asked driver sees the same request',
+    secondDriverView.body.open[0]?.shipment.id === reqId, secondDriverView.body.open);
+
+  // A driver who was not eligible was never asked, so cannot even see it.
+  if (rejectedIds.length > 0) {
+    const outsider = await api(`/driver/requests?driverId=${rejectedIds[0]}`);
+    check('A driver who was never asked does not see the request',
+      outsider.body.open.every((o: any) => o.shipment.id !== reqId), outsider.body.open);
+  }
+
+  // One pass must not cancel it: the load is still live for everyone else.
+  const pass1 = await api(`/load-requests/${reqId}/decline`, {
+    method: 'POST',
+    body: JSON.stringify({ driverId: eligibleIds[0], reason: 'Already loaded today' }),
+  });
+  check('A decline is accepted', pass1.status === 200, pass1.body);
+  check('One decline leaves the request open', pass1.body.stillOpen === true, pass1.body.stillOpen);
+  check('The request is still AWAITING_DRIVER after one pass',
+    pass1.body.shipment.status === 'AWAITING_DRIVER', pass1.body.shipment.status);
+  check('The passing driver is recorded, the rest are untouched',
+    pass1.body.shipment.declinedDriverIds?.length === 1 &&
+      pass1.body.shipment.declinedDriverIds[0] === eligibleIds[0],
+    pass1.body.shipment.declinedDriverIds);
+  check('The passing driver no longer sees it as actionable',
+    (await api(`/driver/requests?driverId=${eligibleIds[0]}`)).body.counts.open === 0);
+  check('Another driver still can',
+    (await api(`/driver/requests?driverId=${eligibleIds[1]}`)).body.counts.open === 1);
+  check('The requester is told the load is still available',
+    (await api('/state')).body.notifications.some(
+      (n: any) => n.type === 'LOAD_REQUEST_PARTIAL' && n.recipientId === shipperId,
+    ), 'shipper should be told the request is still open');
+
+  // A decline from someone who was never asked must not be able to close a request.
+  if (rejectedIds.length > 0) {
+    const bogusPass = await api(`/load-requests/${reqId}/decline`, {
+      method: 'POST',
+      body: JSON.stringify({ driverId: rejectedIds[0] }),
+    });
+    check('A driver who was never asked cannot pass on the request', bogusPass.status >= 400, bogusPass.body);
+    check('That attempt did not disturb the ask list',
+      (await api(`/load-requests/${reqId}/board`)).body.counts.asked === eligibleIds.length);
+  }
+
+  // Five drivers hit accept at once. Exactly one may win.
+  const contenders = eligibleIds.slice(1, 6);
+  const trucksBeforeRace: any[] = (await api('/state')).body.trucks;
+  const raceResults = await Promise.all(
+    contenders.map((driverId) =>
+      api(`/load-requests/${reqId}/accept`, { method: 'POST', body: JSON.stringify({ driverId }) }),
+    ),
+  );
+  const winners = raceResults.filter((r) => r.status === 200);
+  const losers = raceResults.filter((r) => r.status === 409);
+  check('Exactly one of five simultaneous accepts succeeds', winners.length === 1,
+    raceResults.map((r, i) => ({ driver: contenders[i], status: r.status })));
+  check('The other four are told the load is gone', losers.length === contenders.length - 1,
+    raceResults.map((r, i) => ({ driver: contenders[i], status: r.status })));
+  check('A 409 names the driver who took it, so the loser is not left guessing',
+    typeof losers[0]?.body?.error?.message === 'string' && losers[0].body.error.message.length > 0,
+    losers[0]?.body);
+
+  const winnerId: string = winners[0].body.acceptedBy;
+  const winningShipment = winners[0].body.shipment;
+  check('The winner binds a truck and confirms the shipment',
+    winningShipment.truckId !== null && winningShipment.status === 'CONFIRMED',
+    { truckId: winningShipment.truckId, status: winningShipment.status });
+  const winningTruckId: string = winningShipment.truckId;
+
+  // Tonnage: the winner's truck is down by exactly the load, and nobody else's moved.
+  // Compare against a snapshot taken before the race, otherwise this asserts nothing.
+  const trucksAfterRace: any[] = (await api('/state')).body.trucks;
+  const movedTruckIds = trucksAfterRace
+    .filter((t: any) => {
+      const before = trucksBeforeRace.find((b: any) => b.id === t.id);
+      return before && before.availableT !== t.availableT;
+    })
+    .map((t: any) => t.id);
+  check('Exactly one truck lost tonnage', movedTruckIds.length === 1, movedTruckIds);
+  check('It is the truck the winner was given', movedTruckIds[0] === winningTruckId,
+    { moved: movedTruckIds, winner: winningTruckId });
+  const winnerTruck = trucksAfterRace.find((t: any) => t.id === winningTruckId);
+  const winnerTruckBefore = trucksBeforeRace.find((t: any) => t.id === winningTruckId);
+  check('The winner was charged exactly the 2T it agreed to take',
+    Math.abs((winnerTruckBefore.availableT - winnerTruck.availableT) - 2) < 0.001,
+    { before: winnerTruckBefore.availableT, after: winnerTruck.availableT });
+
+  // The board tells the truth about who lost it, so the Driver tab cannot keep
+  // showing an accept button that can no longer work.
+  const boardAfter = await api(`/load-requests/${reqId}/board`);
+  check('The board is closed', boardAfter.body.open === false, boardAfter.body.open);
+  check('Exactly one row is WON', boardAfter.body.counts.won === 1, boardAfter.body.counts);
+  check('Every driver who did not win is DECLINED or LOST, never PENDING',
+    boardAfter.body.board.every((e: any) => e.response !== 'PENDING'), boardAfter.body.board);
+  check('The winner is named on the board',
+    boardAfter.body.winner?.driverId === winnerId, boardAfter.body.winner);
+  const losingDriverIds = contenders.filter((_, i) => raceResults[i].status === 409);
+  check('There is a loser to check the view of', losingDriverIds.length === contenders.length - 1, losingDriverIds);
+  const loserView = await api(`/driver/requests?driverId=${losingDriverIds[0]}`);
+  check('A driver who lost the race sees it under lost, with the winner named',
+    loserView.body.lost.some((l: any) => l.shipment.id === reqId && typeof l.wonBy === 'string' && l.wonBy.length > 0),
+    loserView.body.lost);
+  check('And it is no longer offered to them as something they can accept',
+    loserView.body.open.every((o: any) => o.shipment.id !== reqId), loserView.body.open);
+  check('The winner sees it under won',
+    (await api(`/driver/requests?driverId=${winnerId}`)).body.won.some((s: any) => s.id === reqId));
+
+  // Once taken, the last man standing still cannot take it.
+  const latecomer = await api(`/load-requests/${reqId}/accept`, {
+    method: 'POST',
+    body: JSON.stringify({ driverId: eligibleIds[eligibleIds.length - 1] }),
+  });
+  check('A driver who never answered can still not take a taken load', latecomer.status === 409, latecomer.body);
+
+  // Every driver declining must close the request and reserve nothing.
+  section('16b. When every driver passes, the request closes and nothing is reserved');
+  const doomed = await api('/load-requests', {
+    method: 'POST',
+    body: JSON.stringify({
+      shipperId,
+      cargoName: 'Nobody Wants This',
+      origin: 'Bengaluru',
+      destination: 'Chennai',
+      weightT: 0.5,
+    }),
+  });
+  const doomedId: string = doomed.body.shipment.id;
+  const doomedAsk: string[] = doomed.body.shipment.askedDriverIds ?? [];
+  check('The doomed request was asked to at least one driver', doomedAsk.length >= 1, doomedAsk);
+
+  // Every driver but the last passes; the load must survive all of those.
+  for (let i = 0; i < doomedAsk.length - 1; i += 1) {
+    const mid = await api(`/load-requests/${doomedId}/decline`, {
+      method: 'POST',
+      body: JSON.stringify({ driverId: doomedAsk[i] }),
+    });
+    if (i === doomedAsk.length - 2) {
+      check('Still open with only one driver left to answer', mid.body.stillOpen === true, mid.body);
+    }
+  }
+  const lastPass = await api(`/load-requests/${doomedId}/decline`, {
+    method: 'POST',
+    body: JSON.stringify({ driverId: doomedAsk[doomedAsk.length - 1] }),
+  });
+  check('The final decline closes the request', lastPass.body.stillOpen === false, lastPass.body);
+  check('A fully declined request returns to DRAFT, holding no truck',
+    lastPass.body.shipment.status === 'DRAFT' &&
+      lastPass.body.shipment.truckId === null &&
+      lastPass.body.shipment.capacityOfferId === null,
+    lastPass.body.shipment);
+  check('It records why it closed', typeof lastPass.body.shipment.closedReason === 'string' &&
+    lastPass.body.shipment.closedReason!.length > 0, lastPass.body.shipment.closedReason);
+  check('The requester is told the load went unclaimed',
+    (await api('/state')).body.notifications.some(
+      (n: any) => n.type === 'SHIPMENT_DECLINED' && n.recipientId === shipperId,
+    ), 'shipper should be told nobody took it');
+  check('A closed request can be reopened by opening a new one',
+    (await api(`/load-requests/${doomedId}/board`)).body.open === false);
+
+  section('17. Reset restores the exact demo state');
   await api('/demo/reset', { method: 'POST' });
   const afterReset = await api('/state');
   const t027 = afterReset.body.trucks.find((t: any) => t.id === 'FG-027');

@@ -4,6 +4,7 @@ import { flashClassFor } from '../lib/flash';
 import { useFleet } from '../store/FleetContext';
 import { AppHeader } from '../components/AppHeader';
 import { Panel, Placeholder } from '../components/Panel';
+import { LoadBoard } from '../components/LoadBoard';
 import { StatusPill } from '../components/Primitives';
 import { cn, formatT, formatRelative } from '../lib/format';
 import { incidentTypeLabel, shipmentTone, truckTone } from '../lib/tone';
@@ -191,8 +192,12 @@ export function Driver() {
     <div className="relative z-10 min-h-screen">
       <AppHeader />
 
-      <main className="mx-auto max-w-md px-4 py-4">
-        <div className="space-y-4">
+      <main className="mx-auto max-w-6xl px-4 py-4">
+        {/* The crew and the open board come first: one load can sit in front of every
+            driver who can take it, and that is the thing worth seeing. */}
+        <LoadBoard selfDriverId={driverId} />
+
+        <div className="mx-auto mt-6 max-w-md space-y-4">
           <div className="flex items-center justify-between">
             <div>
               <div className="eyebrow">Driver</div>

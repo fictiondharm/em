@@ -19,6 +19,9 @@ const TRUCK_TONE: Record<TruckStatus, Tone> = {
 
 const SHIPMENT_TONE: Record<ShipmentStatus, Tone> = {
   DRAFT: 'neutral',
+  // Live on the board with drivers, waiting for the first accept. Blue, not green:
+  // nothing is secured yet, so it must not read like a completed booking.
+  AWAITING_DRIVER: 'accent',
   CAPACITY_RESERVED: 'accent',
   CONFIRMED: 'accent',
   IN_TRANSIT: 'accent',

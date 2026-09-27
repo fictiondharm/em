@@ -44,8 +44,10 @@ function isNodeError(err: unknown): err is NodeJS.ErrnoException {
  *
  * Design notes:
  * - Reads are served from memory (fast) and hydrated once at boot.
- * - Writes are serialised per collection through `writeChain`, so two concurrent
- *   mutations can never interleave a partial file.
+ * - Mutations are serialised per collection through `mutationChain`, so the
+ *   read-modify-write cycle in create/update/delete cannot interleave. Serialising only
+ *   the file write is not enough: five parallel creates would each read the same base
+ *   array and the last one would win, silently dropping the other four rows.
  * - Files are written to a temp path then renamed, so a crash mid-write cannot
  *   leave a truncated JSON file behind.
  */
@@ -53,6 +55,24 @@ export function createJsonStore<T extends { id: string }>(options: JsonStoreOpti
   const { filePath, name } = options;
   let cache: T[] | null = null;
   let writeChain: Promise<unknown> = Promise.resolve();
+  let mutationChain: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Run a read-modify-write cycle with exclusive access to the collection.
+   *
+   * `load()` inside the callback always sees the result of the previous mutation, which
+   * is what makes concurrent `Promise.all` writes accumulate instead of clobbering.
+   */
+  function enqueue<R>(fn: () => Promise<R>): Promise<R> {
+    const run = mutationChain.then(fn, fn);
+    // Keep the chain alive even if this mutation throws, so one failure cannot wedge
+    // every later write to this collection.
+    mutationChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
 
   async function load(): Promise<T[]> {
     if (cache) return cache;
@@ -109,43 +129,53 @@ export function createJsonStore<T extends { id: string }>(options: JsonStoreOpti
       return (await load()).find((row) => row.id === id);
     },
     async create(row) {
-      const rows = await load();
-      if (rows.some((r) => r.id === row.id)) {
-        throw new Error(`[store:${name}] duplicate id ${row.id}`);
-      }
-      const next = [...rows, row];
-      cache = next;
-      await flush(next);
-      return row;
+      return enqueue(async () => {
+        const rows = await load();
+        if (rows.some((r) => r.id === row.id)) {
+          throw new Error(`[store:${name}] duplicate id ${row.id}`);
+        }
+        const next = [...rows, row];
+        cache = next;
+        await flush(next);
+        return row;
+      });
     },
     async update(id, patch) {
-      const rows = await load();
-      const index = rows.findIndex((row) => row.id === id);
-      if (index === -1) return undefined;
-      const current = rows[index] as T;
-      const updated = { ...current, ...patch, id: current.id } as T;
-      const next = [...rows];
-      next[index] = updated;
-      cache = next;
-      await flush(next);
-      return updated;
+      return enqueue(async () => {
+        const rows = await load();
+        const index = rows.findIndex((row) => row.id === id);
+        if (index === -1) return undefined;
+        const current = rows[index] as T;
+        const updated = { ...current, ...patch, id: current.id } as T;
+        const next = [...rows];
+        next[index] = updated;
+        cache = next;
+        await flush(next);
+        return updated;
+      });
     },
     async delete(id) {
-      const rows = await load();
-      const next = rows.filter((row) => row.id !== id);
-      if (next.length === rows.length) return false;
-      cache = next;
-      await flush(next);
-      return true;
+      return enqueue(async () => {
+        const rows = await load();
+        const next = rows.filter((row) => row.id !== id);
+        if (next.length === rows.length) return false;
+        cache = next;
+        await flush(next);
+        return true;
+      });
     },
     async clear() {
-      cache = [];
-      await flush(cache);
+      return enqueue(async () => {
+        cache = [];
+        await flush(cache);
+      });
     },
     async replaceAll(rows) {
-      cache = [...rows];
-      await flush(cache);
-      return [...cache];
+      return enqueue(async () => {
+        cache = [...rows];
+        await flush(cache);
+        return [...cache];
+      });
     },
   };
 }

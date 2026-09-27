@@ -15,6 +15,11 @@ export class ApiError extends Error {
     return new ApiError(400, 'BAD_REQUEST', message, details);
   }
 
+  /** The caller is known but not allowed to do this, e.g. a driver outside the ask list. */
+  static forbidden(message: string, details?: unknown): ApiError {
+    return new ApiError(403, 'FORBIDDEN', message, details);
+  }
+
   static notFound(message: string): ApiError {
     return new ApiError(404, 'NOT_FOUND', message);
   }

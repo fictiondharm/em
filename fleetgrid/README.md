@@ -27,19 +27,25 @@ starting the web app (see `.env.example`).
 
 0. **Sign up** — from the role screen choose *Create an account*, then pick **Business** or **Driver**. A driver
    can attach a truck in the same step, which is what makes them able to receive offers immediately.
-1. **Business** — search `Bengaluru → Chennai` for `1.2` tonnes, select the **FG-027** offer, then
-   *Reserve capacity & request driver*. One server call reserves the tonnage atomically and leaves the shipment
-   at `CAPACITY_RESERVED` — the truck goes `AVAILABLE → ASSIGNED` and its spare tonnage drops on every device at
-   once. A panel also lists the other trucks nearest this one, with their spare tonnage.
+1. **Business** — set the lane and weight. The live count tells you how many drivers can take it, and
+   **Send to all eligible drivers** broadcasts it: every eligible driver is asked at once, nothing is
+   reserved yet, and the shipment sits in `AWAITING_DRIVER`. The ask list is frozen at that moment.
+   - *Reserve capacity & request driver* is the other path: pick a named truck such as **FG-027** and one
+     server call reserves the tonnage atomically, leaving the shipment at `CAPACITY_RESERVED`.
+   - A panel lists the other trucks nearest the one you picked, with their spare tonnage.
    - Search a **half route** like `Bengaluru → Hosur` and the results include trucks *passing through*, not just
      trucks booked for that leg.
    - Search a load **bigger than any truck** (e.g. `10.0` tonnes) and you get a concrete split plan across
      several trucks instead of an empty result.
-2. **Driver** — the load appears under *Loads waiting for you*. **Accept** runs `CAPACITY_RESERVED → CONFIRMED`;
-   **Decline** gives the tonnage back and returns the shipment to `DRAFT` so the business can rebook. A decline is
-   shown as an amber **declined** badge with a plain explanation, never as a success — the row flash is toned by
-   the event that caused it. Until the driver accepts, the truck **cannot depart** — the server rejects it. Then
-   start the journey.
+2. **Driver** — the tab now lists **all nine drivers**; pick one to act as them.
+   - On a broadcast, their open requests show how many other drivers hold the same one. **Accept** takes it
+     (`AWAITING_DRIVER → CONFIRMED`); **Decline** passes, and the load stays open for everyone else until
+     the last one passes. *Who else* opens the board for that request.
+   - On a direct reservation, the load appears under *Loads waiting for you*. **Accept** runs
+     `CAPACITY_RESERVED → CONFIRMED`; **Decline** gives the tonnage back and returns the shipment to `DRAFT`.
+   - A decline is shown as an amber **declined** badge with a plain explanation, never as a success — the
+     row flash is toned by the event that caused it. Until the driver accepts, the truck **cannot depart** —
+     the server rejects it. Then start the journey.
 3. **Incident** — the driver reports a breakdown. The truck goes `INCIDENT` and the shipment `AT_RISK`.
 4. **Control Tower** — analyze the incident, review the deterministic options, approve, then execute. The
    cargo is reassigned, the disabled truck returns to service, and the panel keeps a verified readback of
@@ -108,9 +114,50 @@ that tab was closed are still there on return.
 capacity, active load count, and any load waiting on that driver's approval, with counts for totals. The
 Control Tower renders it as a Drivers panel next to Trucks.
 
-The driver console stays scoped to the signed-in driver on purpose — one driver needs their own queue, not
-everyone else's. The roster is the operator's view of the fleet, and it is why "all drivers" is answerable from
-the API rather than inferred from whichever driver happens to be signed in.
+### Broadcasting one load to every driver
+
+The reservation flow above pins a load to one named truck. A broadcast does not: the shipper offers the
+load to **every driver who can actually take it**, and the first one to accept takes it.
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /load-requests` | Opens a request in `AWAITING_DRIVER`, asking every eligible driver |
+| `GET /load-requests/eligible` | Preview: who can take it, and why each other driver cannot |
+| `GET /load-requests/:id/board` | Who was asked, who answered, who won |
+| `POST /load-requests/:id/accept` | First accept takes the load; a later one gets `409` naming the winner |
+| `POST /load-requests/:id/decline` | Pass. The load stays open for everyone else |
+| `GET /driver/requests?driverId=` | One driver's view: open, won, lost, and how many others hold each |
+
+Four decisions make this behave the way a dispatcher would expect:
+
+- **Nothing is reserved at open time.** No truck is bound and no tonnage is held, so broadcasting a load
+  costs the shipper the guarantee of a named vehicle. The moment somebody accepts, exactly one truck is
+  charged exactly the agreed weight.
+- **The ask list is frozen.** Eligibility is decided once, when the request opens. A driver who was passed
+  by is never quietly added later, so the board cannot lie about who was offered the load.
+- **First accept wins, under a lock.** Five drivers accepting at the same moment produce one `200` and
+  four `409`s. The losers are told who won rather than left guessing.
+- **A decline is not a cancellation.** One driver passing leaves the request open for the rest; only the
+  final decline closes it, back to `DRAFT` with nothing reserved and a recorded reason.
+
+A driver who never answered and loses the race is reported as `LOST`, not `PENDING` — otherwise the tab
+would keep offering an accept button that can no longer work.
+
+### All nine drivers, in one tab
+
+The Driver tab lists the whole crew and lets you act as any of them, because the interesting question about
+a broadcast is not "what did this driver see" but "who else had the same offer, and who got there first".
+Selecting a driver shows their open requests with the count of others holding each, what they won, and
+what went to somebody else. *Who else* opens the full board for one request.
+
+The switcher is a demo affordance, not authentication: it does not check who is signed in. Real deployment
+needs the driver's own identity to scope `/driver/requests`, and that is the one thing this flow does not
+prove.
+
+**Notifications are addressed per user, not per organization.** One org holds the whole fleet, so an
+org-level notice would wake all nine drivers for a single load. The client matches a notification against
+both the signed-in organization and the signed-in user, which is why a driver is told about a request they
+were part of and hears nothing when they are not.
 
 ---
 
@@ -122,8 +169,9 @@ fleetgrid/
     src/store/            JSON file collections, atomic writes, mutation mutex
     src/services/         domain logic and state machines
     src/routes/           REST API + endpoint index
-    src/seed/             deterministic demo dataset
-    test/flow.test.ts     end-to-end suite (230 checks, incl. two WebSocket clients)
+    src/seed/            deterministic demo dataset
+    test/store.test.ts   JSON store unit tests, incl. the concurrent-write regression
+    test/flow.test.ts    end-to-end suite (277 checks, incl. two WebSocket clients)
   web/                    React + Vite + Tailwind single-page app
     src/store/            snapshot context, refetch-on-event, mode persistence
     src/views/            ControlTower, Business, Driver, Register, RoleSelect
@@ -138,7 +186,8 @@ stores locally is the selected mode (`localStorage["fleetgrid.mode"]`).
 ### Realtime
 
 Native `ws` endpoint at `/realtime`. Events: `connected`, `demo.reset`, `truck.updated`,
-`driver.updated`, `shipment.created`, `shipment.updated`, `capacity.updated`, `incident.created`,
+`driver.updated`, `shipment.created`, `shipment.updated`, `load_request.opened`, `load_request.accepted`,
+`load_request.declined`, `load_request.closed`, `capacity.updated`, `incident.created`,
 `incident.updated`, `recovery.updated`, `payment.updated`, `notification.created`, `event.appended`.
 
 Clients treat events as a signal to refetch, never as the new state. That keeps a reconnect or a missed
@@ -146,9 +195,17 @@ frame from leaving a device stale.
 
 ### Persistence
 
-Server-side JSON files under `server/data/`, written atomically (temp file + rename) and serialized
-behind a re-entrant mutex, so concurrent bookings cannot oversell the same tonnage. No database, no
-container, no migration step — the seed rebuilds itself when the directory is empty.
+Server-side JSON files under `server/data/`, written atomically (temp file + rename). Two separate locks,
+because they solve different problems:
+
+- **Per-collection mutation chain** guards the whole read-modify-write cycle in
+  `create`/`update`/`delete`/`replaceAll`. Serialising only the file write is not enough: five parallel
+  creates would each read the same base array and the last would win. This silently dropped four of the
+  five driver notifications on a broadcast, and `test/store.test.ts` now covers it directly.
+- **Domain mutex** (`runExclusive`) guards the business rules — tonnage, accept races, and state-machine
+  transitions — so two bookings cannot oversell the same truck.
+
+No database, no container, no migration step — the seed rebuilds itself when the directory is empty.
 
 ---
 
@@ -159,10 +216,14 @@ Enforced server-side in `server/src/types.ts`; an illegal transition is a `409`,
 - **Truck** `AVAILABLE → ASSIGNED → LOADING → IN_TRANSIT → DELIVERED`, with `DELAYED`, `INCIDENT`, and
   `RECOVERY` branches. Completing a recovery returns the disabled truck to `AVAILABLE` so the demo is
   repeatable without a reset. A truck whose last cargo is delivered also completes.
-- **Shipment** `DRAFT → CAPACITY_RESERVED → CONFIRMED → IN_TRANSIT → DELIVERED`, plus `AT_RISK` and
-  `RECOVERY`. `DELIVERED` is reached only by the business confirming receipt via
-  `POST /shipments/:id/confirm-delivery` — the driver dropping the cargo is not proof of delivery, and
-  the client cannot assert it locally. The call is idempotent, so a double tap on two devices is safe.
+- **Shipment** `DRAFT → AWAITING_DRIVER → CONFIRMED → IN_TRANSIT → DELIVERED`, plus `AT_RISK` and
+  `RECOVERY`. `AWAITING_DRIVER` is the broadcast state: live on the board, no truck bound, nothing
+  reserved. It returns to `DRAFT` if every asked driver passes, and can go back to `AWAITING_DRIVER` from
+  `DRAFT` when a request is re-offered. The direct reservation path `DRAFT → CAPACITY_RESERVED →
+  CONFIRMED` still exists and pins the load to a named truck. `DELIVERED` is reached only by the business
+  confirming receipt via `POST /shipments/:id/confirm-delivery` — the driver dropping the cargo is not
+  proof of delivery, and the client cannot assert it locally. The call is idempotent, so a double tap on
+  two devices is safe.
 - **Incident** `OPEN → ANALYZING → PLAN_READY → RESOLVED`, plus `ESCALATED`.
 - **Recovery plan** `PENDING_APPROVAL → APPROVED → EXECUTING → COMPLETED`, plus `REJECTED`.
 
@@ -268,13 +329,14 @@ screen says how many legs were booked rather than pretending the whole thing wor
 
 ### Testing
 
-`npm test` boots the real server on a spare port and exercises the golden flow over HTTP and two
-independent WebSocket clients: seed integrity, capacity search, oversell rejection, atomic reservation,
-departure, incident creation, recovery options, the approval gate (including a bypass attempt that must
-fail), execution, idempotent re-execution, timeline, delivery confirmation, the honesty of
-the unwired integration routes, the published tool contract, registration, the driver approval
-gate, and reset. 230 checks, no
-mocking of business rules.
+`npm test` runs two suites. `test/store.test.ts` (17 checks) unit-tests the JSON store directly, including
+the concurrent-write regression. `test/flow.test.ts` (277 checks) boots the real server on a spare port and
+exercises the golden flow over HTTP and two independent WebSocket clients: seed integrity, capacity search,
+oversell rejection, atomic reservation, departure, incident creation, recovery options, the approval gate
+(including a bypass attempt that must fail), execution, idempotent re-execution, timeline, delivery
+confirmation, the honesty of the unwired integration routes, the published tool contract, registration, the
+driver approval gate, a broadcast taken by exactly one of five simultaneous accepts, and reset. No mocking
+of business rules.
 
 ---
 

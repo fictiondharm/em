@@ -2,10 +2,14 @@ import { API_BASE } from './config';
 import type {
   CapacityOptions,
   CapacityMatch,
+  DriverRequests,
   DriverRosterRow,
   DemoLoginResponse,
+  EligibleDriver,
   FleetSnapshot,
   Incident,
+  LoadRequestBoard,
+  Notification,
   RecoveryOption,
   RecoveryPlan,
   Role,
@@ -125,6 +129,69 @@ export const api = {
       drivers: DriverRosterRow[];
       counts: { total: number; onATruck: number; awaitingApproval: number };
     }>('/drivers'),
+
+  /**
+   * Open one request to every driver who can take it. No truck is bound and no tonnage
+   * is held until somebody accepts, so the answer is how many drivers were asked.
+   */
+  openLoadRequest: (body: {
+    shipperId: string;
+    cargoName: string;
+    origin: string;
+    destination: string;
+    weightT: number;
+    reference?: string;
+    actorId?: string;
+  }) =>
+    post<{
+      ok: true;
+      shipment: Shipment;
+      board: LoadRequestBoard;
+      askedCount: number;
+      notifications: Notification[];
+    }>('/load-requests', body),
+
+  /** Preview the field before committing: who can take this, and who cannot and why. */
+  loadRequestEligible: (params: { origin: string; destination: string; weightT: number }) => {
+    const qs = new URLSearchParams({
+      origin: params.origin,
+      destination: params.destination,
+      weightT: String(params.weightT),
+    });
+    return request<{
+      eligible: EligibleDriver[];
+      rejected: EligibleDriver[];
+      counts: { eligible: number; rejected: number };
+    }>(`/load-requests/eligible?${qs.toString()}`);
+  },
+
+  /** Who got a request, who answered, who won. Read from the frozen ask list. */
+  loadRequestBoard: (id: string) => request<{ ok: true } & LoadRequestBoard>(`/load-requests/${id}/board`),
+
+  /** First accept takes the load. A 409 means another driver got there first. */
+  acceptLoadRequest: (id: string, driverId: string) =>
+    post<{ ok: true; acceptedBy: string; shipment: Shipment; board: LoadRequestBoard; notifications: Notification[] }>(
+      `/load-requests/${id}/accept`,
+      { driverId },
+    ),
+
+  /** Pass. The request stays open for the other drivers unless this was the last one. */
+  declineLoadRequest: (id: string, driverId: string, reason?: string) =>
+    post<{
+      ok: true;
+      declinedBy: string;
+      shipment: Shipment;
+      board: LoadRequestBoard;
+      stillOpen: boolean;
+      notifications: Notification[];
+    }>(`/load-requests/${id}/decline`, { driverId, ...(reason ? { reason } : {}) }),
+
+  /** One driver's view of the open board, including how many others hold each request. */
+  driverRequests: (driverId: string) => {
+    const qs = new URLSearchParams({ driverId });
+    return request<DriverRequests>(`/driver/requests?${qs.toString()}`);
+  },
+
   capacity: (params: { origin?: string; destination?: string; weightT?: number; includeAll?: boolean }) => {
     const qs = new URLSearchParams();
     if (params.origin) qs.set('origin', params.origin);

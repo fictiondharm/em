@@ -96,8 +96,10 @@ shipmentsRouter.get(
 shipmentsRouter.post(
   '/shipments/:id/confirm',
   asyncHandler(async (req, res) => {
-    const shipment = await confirmShipment(requiredParam(req, 'id'), { actorType: 'DRIVER' });
-    res.json({ ok: true, shipment, acceptedBy: 'DRIVER' });
+    const result = await confirmShipment(requiredParam(req, 'id'), { actorType: 'DRIVER' });
+    // `notifications` tells the caller the requester was notified, so the response
+    // does not claim a notification it did not create.
+    res.json({ ok: true, shipment: result.shipment, acceptedBy: 'DRIVER', notifications: result.notifications });
   }),
 );
 
@@ -123,13 +125,16 @@ shipmentsRouter.post(
       actorType: 'DRIVER',
       actorId: body.actorId ?? null,
     });
-    res.json({
-      ok: true,
-      declined: true,
-      shipment: result.shipment,
-      releasedTruck: result.truck,
-      releasedOffer: result.offer,
-    });
+      res.json({
+        ok: true,
+        declined: true,
+        shipment: result.shipment,
+        releasedTruck: result.truck,
+        releasedOffer: result.offer,
+        // The requester and the operator are told the load was declined, so a decline
+        // is never a silent rollback on the shipper's screen.
+        notifications: result.notifications,
+      });
   }),
 );
 

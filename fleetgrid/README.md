@@ -70,6 +70,48 @@ machine cannot disagree.
 Declining has no `CANCELLED` state to fall back on, so it returns the shipment to `DRAFT` with the capacity
 released — the shipment still exists and is still editable, it simply no longer holds tonnage.
 
+### Accept and decline both notify the requester
+
+A decline is the one outcome a requester cannot see happening: their screen quietly returns to `DRAFT` and
+nothing says why. Both sides of the gate now create notifications addressed to the requesting organization.
+
+| Action | Notification | Recipient |
+| --- | --- | --- |
+| `POST /shipments/:id/decline` | `SHIPMENT_DECLINED` | the shipper who requested the load |
+| `POST /shipments/:id/decline` | `CAPACITY_DECLINED` | the operator, since tonnage is back on the truck |
+| `POST /shipments/:id/confirm` | `SHIPMENT_ACCEPTED` | the shipper who requested the load |
+
+The shipper notice names the driver and truck, the shipment id, cargo, weight and route, repeats the driver's
+reason verbatim, and says what to do next. The operator notice reports the freed tonnage. `GET /notifications`
+lists them, and each is broadcast as `notification.created`.
+
+Two properties are enforced rather than assumed:
+
+- **Idempotent.** Re-confirming a shipment returns the same row and creates no second notification, so a double
+  tap on three devices does not produce three identical emails.
+- **Organization-scoped.** `recipientId` holds a shipper org id for the requester notice and an operator org id
+  for the freed-capacity note, so the client filters on its own organization. A driver never sees a shipper's
+  news and a shipper never sees the operator's.
+
+Delivery stays `PENDING`. There is no delivery infrastructure in this phase, so nothing claims to have sent
+anything — the notification is stored and pushed in-app only.
+
+On the client, `notification.created` becomes a toast (`web/src/components/NotificationToasts.tsx`) mounted once
+at the app root, so a decline reaches the requester whichever screen they are on. Tone follows the row-flash
+vocabulary in `lib/flash.ts`: accept is green, decline is amber, incidents and recovery are red. A decline never
+renders as a success. Business also keeps a persistent Alerts panel fed from the snapshot, so notices sent while
+that tab was closed are still there on return.
+
+### The driver roster
+
+`GET /drivers` returns the whole crew joined to their truck and current work: lane, spare tonnage against
+capacity, active load count, and any load waiting on that driver's approval, with counts for totals. The
+Control Tower renders it as a Drivers panel next to Trucks.
+
+The driver console stays scoped to the signed-in driver on purpose — one driver needs their own queue, not
+everyone else's. The roster is the operator's view of the fleet, and it is why "all drivers" is answerable from
+the API rather than inferred from whichever driver happens to be signed in.
+
 ---
 
 ## Architecture
@@ -81,7 +123,7 @@ fleetgrid/
     src/services/         domain logic and state machines
     src/routes/           REST API + endpoint index
     src/seed/             deterministic demo dataset
-    test/flow.test.ts     end-to-end suite (209 checks, incl. two WebSocket clients)
+    test/flow.test.ts     end-to-end suite (230 checks, incl. two WebSocket clients)
   web/                    React + Vite + Tailwind single-page app
     src/store/            snapshot context, refetch-on-event, mode persistence
     src/views/            ControlTower, Business, Driver, Register, RoleSelect
@@ -231,7 +273,7 @@ independent WebSocket clients: seed integrity, capacity search, oversell rejecti
 departure, incident creation, recovery options, the approval gate (including a bypass attempt that must
 fail), execution, idempotent re-execution, timeline, delivery confirmation, the honesty of
 the unwired integration routes, the published tool contract, registration, the driver approval
-gate, and reset. 209 checks, no
+gate, and reset. 230 checks, no
 mocking of business rules.
 
 ---

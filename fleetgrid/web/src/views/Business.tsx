@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../lib/api';
 import { flashClassFor } from '../lib/flash';
+import { notificationsFor } from '../lib/notifications';
 import { useFleet } from '../store/FleetContext';
 import { AppHeader } from '../components/AppHeader';
 import { Panel, Placeholder } from '../components/Panel';
@@ -58,6 +59,12 @@ export function Business() {
   const activeShipment = useMemo(
     () => myShipments.find((s) => s.status !== 'DELIVERED') ?? null,
     [myShipments],
+  );
+
+  /** Notifications addressed to this shipper — decline notices land here. */
+  const myAlerts = useMemo(
+    () => notificationsFor(snapshot.notifications, shipperId),
+    [snapshot.notifications, shipperId],
   );
 
   /** Most recent event for a shipment, so a decline can be named rather than implied. */
@@ -692,6 +699,36 @@ export function Business() {
                     </Placeholder>
                   </div>
                 </div>
+              )}
+
+              {myAlerts.length > 0 && (
+                <Panel
+                  eyebrow="Alerts"
+                  title="Notifications for your account"
+                  bodyClassName="p-0"
+                  className="min-h-[120px]"
+                >
+                  <ul className="divide-y divide-base-700">
+                    {myAlerts.slice(0, 6).map((n) => (
+                      <li key={n.id} className="px-4 py-2.5">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={cn(
+                              'rounded border px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-[0.1em]',
+                              n.type === 'SHIPMENT_DECLINED'
+                                ? 'border-warn/45 bg-warn/10 text-warn'
+                                : 'border-base-600 text-ink-400',
+                            )}
+                          >
+                            {n.type.replace(/_/g, ' ')}
+                          </span>
+                          <span className="font-mono text-[10px] text-ink-500">{formatTime(n.createdAt)}</span>
+                        </div>
+                        <p className="mt-1 text-[11px] leading-relaxed text-ink-200">{n.message}</p>
+                      </li>
+                    ))}
+                  </ul>
+                </Panel>
               )}
 
               <Panel eyebrow="My shipments" title="Tracking" bodyClassName="p-0" className="min-h-[200px]">

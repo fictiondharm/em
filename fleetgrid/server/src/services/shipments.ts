@@ -1,13 +1,13 @@
 import { db } from '../store/db.js';
 import { ApiError } from '../lib/errors.js';
 import { canonicalLocation } from '../lib/geo.js';
-import { nowIso, round } from '../lib/ids.js';
+import { newId, nowIso, round } from '../lib/ids.js';
 import { runExclusive } from '../lib/mutex.js';
 import { reserveCapacity, syncOfferForTruck } from './capacity.js';
 import { assertTransition, recordEvent } from './events.js';
 import { hub } from './realtime.js';
 import { transitionTruck } from './trucks.js';
-import { SHIPMENT_TRANSITIONS, type ActorType, type CapacityOffer, type Driver, type Shipment, type ShipmentStatus, type Truck } from '../types.js';
+import { SHIPMENT_TRANSITIONS, type ActorType, type CapacityOffer, type Driver, type Notification, type Shipment, type ShipmentStatus, type Truck } from '../types.js';
 
 export const MAX_SHIPMENT_WEIGHT_T = 50;
 
@@ -198,7 +198,7 @@ export async function createShipment(input: CreateShipmentInput): Promise<Create
 export async function declineShipment(
   shipmentId: string,
   input: { reason?: string | null; actorType?: ActorType; actorId?: string | null } = {},
-): Promise<{ shipment: Shipment; truck: Truck | null; offer: CapacityOffer | null }> {
+): Promise<{ shipment: Shipment; truck: Truck | null; offer: CapacityOffer | null; notifications: Notification[] }> {
   return runExclusive(async () => {
     const shipment = await db.shipments.findById(shipmentId);
     if (!shipment) {
@@ -269,8 +269,100 @@ export async function declineShipment(
       actorId: input.actorId ?? null,
     });
 
-    return { shipment: updated, truck: releasedTruck, offer: releasedOffer };
+    const notifications = await notifyDecline(updated, releasedTruck, input);
+
+    return { shipment: updated, truck: releasedTruck, offer: releasedOffer, notifications };
   });
+}
+
+/**
+ * Tell the requester a load is locked in.
+ *
+ * The mirror of `notifyDecline`. Accepting is easy to miss too: the reservation
+ * flips to CONFIRMED and, without this, the person who booked finds out from a
+ * table refresh rather than from a notification. Names the driver and truck, the
+ * confirmed weight, and what happens next so the row is not ambiguous.
+ */
+async function notifyAcceptance(shipment: Shipment): Promise<Notification[]> {
+  const truck = shipment.truckId ? await db.trucks.findById(shipment.truckId) : undefined;
+  const driver = truck?.driverId ? await db.drivers.findById(truck.driverId) : undefined;
+  const who = driver ? `${driver.name} (${truck!.id})` : truck ? truck.id : 'The driver';
+
+  const row = await db.notifications.create({
+    id: newId('ntf'),
+    recipientId: shipment.shipperId,
+    type: 'SHIPMENT_ACCEPTED',
+    message:
+      `${who} accepted ${shipment.id} (${shipment.cargoName}, ` +
+      `${round(shipment.weightT)}T, ${shipment.origin}  ${shipment.destination}). ` +
+      `The load is confirmed on ${truck ? truck.id : 'the truck'}` +
+      `${shipment.price !== null ? ` at ${shipment.currency} ${round(shipment.price)}` : ''} - ` +
+      `it is locked in and no longer competing for capacity.`,
+    status: 'PENDING',
+    createdAt: nowIso(),
+  });
+
+  hub.broadcast('notification.created', row);
+  return [row];
+}
+
+/**
+ * Tell everyone affected that a load was declined.
+ *
+ * A decline is the one outcome a shipper cannot see happening: their screen just
+ * quietly goes back to DRAFT. The person who requested the load is notified, with
+ * the driver and truck named so they know who to chase, plus what to do next. The
+ * operator is notified too, because the tonnage is back on the market.
+ *
+ * Same shape as the recovery notifications — stored, broadcast, and never reported
+ * as delivered, because delivery infrastructure is a later phase.
+ */
+async function notifyDecline(
+  shipment: Shipment,
+  truck: Truck | null,
+  input: { reason?: string | null; actorType?: ActorType; actorId?: string | null },
+): Promise<Notification[]> {
+  const reason = input.reason?.trim() || 'No reason given';
+  const rows: Notification[] = [];
+
+  // Name the driver, not just the truck: the shipper needs to know who to chase.
+  const driver = truck?.driverId ? await db.drivers.findById(truck.driverId) : undefined;
+  const who = driver ? `${driver.name} (${truck!.id})` : truck ? truck.id : 'The driver';
+
+  // The requester. This is the notification the shipper actually needs.
+  rows.push(
+    await db.notifications.create({
+      id: newId('ntf'),
+      recipientId: shipment.shipperId,
+      type: 'SHIPMENT_DECLINED',
+      message:
+        `${who} declined ${shipment.id} (${shipment.cargoName}, ` +
+        `${round(shipment.weightT)}T, ${shipment.origin} → ${shipment.destination}). ` +
+        `Reason: ${reason}. Nothing is reserved and the tonnage is back on ` +
+        `${truck ? truck.id : 'the truck'} — search again to rebook.`,
+      status: 'PENDING',
+      createdAt: nowIso(),
+    }),
+  );
+
+  // The operator, so a freed truck going back on the road is visible centrally.
+  if (truck) {
+    rows.push(
+      await db.notifications.create({
+        id: newId('ntf'),
+        recipientId: truck.organizationId,
+        type: 'CAPACITY_DECLINED',
+        message:
+          `${truck.id} declined ${shipment.id} (${round(shipment.weightT)}T). ` +
+          `${round(truck.availableT)}T is back on the truck and available to rebook. Reason: ${reason}.`,
+        status: 'PENDING',
+        createdAt: nowIso(),
+      }),
+    );
+  }
+
+  for (const row of rows) hub.broadcast('notification.created', row);
+  return rows;
 }
 
 /**
@@ -284,10 +376,10 @@ export async function declineShipment(
 export async function confirmShipment(
   shipmentId: string,
   actor?: { actorType?: ActorType; actorId?: string | null },
-): Promise<Shipment> {
+): Promise<{ shipment: Shipment; notifications: Notification[] }> {
   return runExclusive(async () => {
     const shipment = await getShipment(shipmentId);
-    if (shipment.status === 'CONFIRMED') return shipment;
+    if (shipment.status === 'CONFIRMED') return { shipment, notifications: [] };
     assertTransition(SHIPMENT_TRANSITIONS, shipment.status, 'CONFIRMED', `Shipment ${shipment.id}`);
 
     const updated = await db.shipments.update(shipmentId, { status: 'CONFIRMED', updatedAt: nowIso() });
@@ -302,7 +394,11 @@ export async function confirmShipment(
       actorId: actor?.actorId ?? null,
     });
     hub.broadcast('shipment.updated', updated);
-    return updated;
+
+    // The accept side of the same promise: whoever asked for the load is told it is
+    // locked in, with the truck, not left watching a reservation that never resolves.
+    const notifications = await notifyAcceptance(updated);
+    return { shipment: updated, notifications };
   });
 }
 

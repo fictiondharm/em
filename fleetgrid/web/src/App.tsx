@@ -1,4 +1,5 @@
 import { FleetProvider, useFleet } from './store/FleetContext';
+import { NotificationToasts } from './components/NotificationToasts';
 import { ControlTower } from './views/ControlTower';
 import { Business } from './views/Business';
 import { Driver } from './views/Driver';
@@ -18,6 +19,9 @@ export default function App() {
   return (
     <FleetProvider>
       <Router />
+      {/* Mounted once at the app root so a decline reaches the requester no matter
+          which screen they are on. */}
+      <NotificationToasts />
     </FleetProvider>
   );
 }

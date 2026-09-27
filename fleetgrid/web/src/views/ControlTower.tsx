@@ -8,6 +8,7 @@ import { NetworkMap } from '../components/NetworkMap';
 import { ShipmentTable } from '../components/ShipmentTable';
 import { EventFeed } from '../components/EventFeed';
 import { IncidentPanel } from '../components/IncidentPanel';
+import { DriverRoster } from '../components/DriverRoster';
 import { cn, formatTime } from '../lib/format';
 import { shipmentTone, truckTone } from '../lib/tone';
 
@@ -134,6 +135,10 @@ export function ControlTower() {
                   <ShipmentTable shipments={shipments} trucks={trucks} flashIds={flashIds} flashTone={flashTone} />
                 </div>
               </Panel>
+
+              <div className="min-h-[240px]">
+                <DriverRoster />
+              </div>
 
               <Panel
                 eyebrow="Fleet"

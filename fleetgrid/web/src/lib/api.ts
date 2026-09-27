@@ -2,6 +2,7 @@ import { API_BASE } from './config';
 import type {
   CapacityOptions,
   CapacityMatch,
+  DriverRosterRow,
   DemoLoginResponse,
   FleetSnapshot,
   Incident,
@@ -118,7 +119,13 @@ export const api = {
       });
       return request<CapacityOptions>(`/capacity/options?${qs.toString()}`);
     },
-    capacity: (params: { origin?: string; destination?: string; weightT?: number; includeAll?: boolean }) => {
+    /** The whole crew with truck, lane, spare tonnage and loads awaiting approval. */
+  drivers: () =>
+    request<{
+      drivers: DriverRosterRow[];
+      counts: { total: number; onATruck: number; awaitingApproval: number };
+    }>('/drivers'),
+  capacity: (params: { origin?: string; destination?: string; weightT?: number; includeAll?: boolean }) => {
     const qs = new URLSearchParams();
     if (params.origin) qs.set('origin', params.origin);
     if (params.destination) qs.set('destination', params.destination);

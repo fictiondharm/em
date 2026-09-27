@@ -266,6 +266,26 @@ export interface CapacityOptions {
   note: string;
 }
 
+/** One row of `GET /drivers` — a driver joined to their truck and current load. */
+export interface DriverRosterRow {
+  id: string;
+  name: string;
+  phone: string;
+  contact: string;
+  status: 'AVAILABLE' | 'ON_JOURNEY' | 'OFF_DUTY';
+  truckId: string | null;
+  truckRegistrationNo: string | null;
+  truckStatus: TruckStatus | null;
+  capacityT: number | null;
+  availableT: number | null;
+  lane: string | null;
+  departureAt: string | null;
+  pricePerT: number | null;
+  activeShipments: number;
+  awaitingApproval: number;
+  awaitingShipmentIds: string[];
+}
+
 export type RealtimeEventType =
   | 'connected'
   | 'demo.reset'

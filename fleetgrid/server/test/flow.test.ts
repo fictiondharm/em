@@ -191,6 +191,26 @@ async function main(): Promise<void> {
     (await api('/capacity/options?origin=Bengaluru&destination=Hosur&weightT=99')).body.impossible !== null,
     (await api('/capacity/options?origin=Bengaluru&destination=Hosur&weightT=99')).body);
 
+  section('4a. The whole driver roster');
+  const roster = await api('/drivers');
+  check('GET /drivers returns every seeded driver', roster.body.drivers.length === 9, roster.body.drivers.length);
+  check('Each driver is joined to their truck and lane',
+    roster.body.drivers.every((d: any) => d.truckId && d.lane && typeof d.lane === 'string'),
+    roster.body.drivers.filter((d: any) => !d.lane).map((d: any) => d.name));
+  check('The roster shows real lanes, not one lane for everyone',
+    new Set(roster.body.drivers.map((d: any) => d.lane)).size >= 4,
+    [...new Set(roster.body.drivers.map((d: any) => d.lane))]);
+  check('Spare tonnage and capacity are both reported per driver',
+    roster.body.drivers.every((d: any) => d.availableT !== null && d.capacityT !== null && d.availableT <= d.capacityT),
+    roster.body.drivers.map((d: any) => [d.truckId, d.availableT, d.capacityT]));
+  check('Roster counts agree with the rows',
+    roster.body.counts.total === roster.body.drivers.length &&
+      roster.body.counts.onATruck === roster.body.drivers.filter((d: any) => d.truckId).length,
+    roster.body.counts);
+  check('Ravi Kumar is one of many, not the only driver',
+    roster.body.drivers.some((d: any) => d.name === 'Ravi Kumar') && roster.body.drivers.length > 1,
+    roster.body.drivers.map((d: any) => d.name));
+
   // Search and booking must agree. Booking a half-route load on a truck that is
   // passing through used to fail with a route-mismatch error after the UI had
   // already offered that truck.
@@ -349,6 +369,31 @@ async function main(): Promise<void> {
   check('Accepting confirms the shipment', accepted.body.shipment?.status === 'CONFIRMED', accepted.body.shipment);
   check('The acceptance is attributed to the DRIVER', accepted.body.acceptedBy === 'DRIVER', accepted.body);
 
+  // The accept side of the same promise as the decline notice: the requester is
+  // told the load is locked in, rather than finding out from a silent table refresh.
+  const acceptNote = (accepted.body.notifications as any[])?.[0];
+  check('Accepting notifies the requester',
+    acceptNote?.type === 'SHIPMENT_ACCEPTED' && acceptNote?.recipientId === shipperId,
+    accepted.body.notifications);
+  check('The acceptance notice names the driver and truck',
+    acceptNote?.message?.includes('Ravi Kumar') && acceptNote?.message?.includes('FG-027'),
+    acceptNote?.message);
+  check('The acceptance notice says the load is confirmed and not up for grabs',
+    /confirmed/i.test(acceptNote?.message ?? '') && /no longer competing/i.test(acceptNote?.message ?? ''),
+    acceptNote?.message);
+  check('Accepting is not reported as a delivery',
+    acceptNote?.status === 'PENDING', acceptNote?.status);
+
+  const acceptTwice = await api(`/shipments/${shipmentId}/confirm`, { method: 'POST' });
+  check('Accepting twice is idempotent and does not re-notify',
+    acceptTwice.status === 200 && (acceptTwice.body.notifications ?? []).length === 0,
+    acceptTwice.body);
+  const noticesForShipment = (await api('/notifications')).body.notifications
+    .filter((n: any) => n.recipientId === shipperId && n.message.includes(shipmentId));
+  check('The requester has exactly one acceptance notice for this load',
+    noticesForShipment.filter((n: any) => n.type === 'SHIPMENT_ACCEPTED').length === 1,
+    noticesForShipment.map((n: any) => n.type));
+
   await sleep(300);
   const offersAfter = await api(`/driver/offers?driverId=${driverId}`);
   check('The queue moves the shipment from pending to accepted',
@@ -382,6 +427,39 @@ async function main(): Promise<void> {
   const spareAfterDecline = (await api('/trucks/FG-027')).body.truck.availableT;
   check('Declining gives the tonnage back', spareAfterDecline === spareBeforeDecline + 0.5,
     { spareBeforeDecline, spareAfterDecline });
+
+  // A decline is the one outcome a shipper cannot see happening, so the requester
+  // has to be told. Without this the load just quietly went back to DRAFT.
+  const declineNotifications = declinedRes.body.notifications as any[];
+  check('Declining notifies the person who requested the load',
+    Array.isArray(declineNotifications) &&
+      declineNotifications.some((n) => n.type === 'SHIPMENT_DECLINED' && n.recipientId === shipperId),
+    declineNotifications);
+  const shipperNotice = declineNotifications.find((n) => n.type === 'SHIPMENT_DECLINED');
+  check('The notice names the driver, not just the truck',
+    shipperNotice?.message?.includes('Ravi Kumar') && shipperNotice?.message?.includes('FG-027'),
+    shipperNotice?.message);
+  check('The notice repeats the reason the driver gave',
+    shipperNotice?.message?.includes('Already full near Hosur'), shipperNotice?.message);
+  check('The notice says nothing is reserved and how to recover',
+    /nothing is reserved/i.test(shipperNotice?.message ?? '') && /rebook/i.test(shipperNotice?.message ?? ''),
+    shipperNotice?.message);
+  check('The notice spells out the load and route that were affected',
+    shipperNotice?.message?.includes(declinedId) &&
+      shipperNotice?.message?.includes('0.5T') &&
+      shipperNotice?.message?.includes('Bengaluru → Chennai'),
+    shipperNotice?.message);
+  check('The operator is told the tonnage is back on the truck',
+    declineNotifications.some((n) => n.type === 'CAPACITY_DECLINED' && n.message.includes('FG-027')),
+    declineNotifications.filter((n) => n.type === 'CAPACITY_DECLINED').map((n) => n.message));
+  check('A notification is never reported as delivered',
+    declineNotifications.every((n) => n.status === 'PENDING'), declineNotifications.map((n) => n.status));
+  check('The decline notice is readable from the notifications feed',
+    (await api('/notifications')).body.notifications.some((n: any) => n.id === shipperNotice?.id),
+    'notification should be listed');
+  check('A declined load notifies nobody for a shipment they did not request',
+    !declineNotifications.some((n) => n.recipientId !== shipperId && n.recipientId !== 'org_fleetgrid_logistics'),
+    declineNotifications.map((n) => n.recipientId));
 
   const declineTwice = await api(`/shipments/${declinedId}/decline`, { method: 'POST', body: JSON.stringify({}) });
   check('Declining twice is rejected with 409', declineTwice.status === 409, declineTwice.body);

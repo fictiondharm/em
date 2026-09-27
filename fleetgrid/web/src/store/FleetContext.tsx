@@ -10,6 +10,7 @@ import {
 } from 'react';
 import { api } from '../lib/api';
 import { flashKindFor, type FlashKind } from '../lib/flash';
+import { toastToneFor, type Toast } from '../lib/notifications';
 import { useRealtime, type ConnectionStatus } from '../lib/realtime';
 import type { DemoLoginResponse, FleetSnapshot, Mode, RealtimeEventType } from '../lib/types';
 
@@ -71,6 +72,9 @@ interface FleetContextValue {
   adoptAccount: (mode: Mode, session: DemoLoginResponse) => void;
   resetDemo: () => Promise<void>;
   lastEventLabel: string | null;
+  /** Live notifications addressed to this session's organization. */
+  toasts: Toast[];
+  dismissToast: (id: string) => void;
 }
 
 const FleetContext = createContext<FleetContextValue | null>(null);
@@ -84,6 +88,17 @@ export function FleetProvider({ children }: { children: ReactNode }) {
   const [lastEvent, setLastEvent] = useState<{ type: string; at: number } | null>(null);
   const [flashIds, setFlashIds] = useState<string[]>([]);
   const [flashTone, setFlashTone] = useState<FlashKind>('ok');
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const sessionRef = useRef<DemoLoginResponse | null>(null);
+  const pushToast = useCallback((t: Toast) => {
+    setToasts((prev) => {
+      if (prev.some((x) => x.id === t.id)) return prev;
+      return [t, ...prev].slice(0, 4);
+    });
+  }, []);
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   const pendingRef = useRef<number | null>(null);
   const flashTimerRef = useRef<number | null>(null);
@@ -115,14 +130,31 @@ export function FleetProvider({ children }: { children: ReactNode }) {
 
       if (REFETCH_EVENTS.has(message.type as RealtimeEventType)) {
         const payload = message.payload as { id?: string; truckId?: string; shipmentId?: string } | null;
-        const ids = [payload?.id, payload?.truckId, payload?.shipmentId].filter(
-          (v): v is string => typeof v === 'string',
-        );
-        if (ids.length) {
-          setFlashIds(ids);
-          setFlashTone(flashKindFor(message.type));
-          if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
-          flashTimerRef.current = window.setTimeout(() => setFlashIds([]), 1600);
+
+        // A notification is addressed to an organization, not a row, so it becomes a
+        // toast rather than a row flash. Delivered only to the recipient's own org,
+        // and it must not flash the notification id as if it were a shipment id.
+        if (message.type === 'notification.created') {
+          const n = message.payload as { id?: string; type?: string; message?: string; recipientId?: string };
+          if (n?.id && n.recipientId && n.recipientId === sessionRef.current?.organization?.id) {
+            pushToast({
+              id: n.id,
+              type: n.type ?? 'NOTIFICATION',
+              message: n.message ?? '',
+              tone: toastToneFor(n.type ?? ''),
+              at: Date.now(),
+            });
+          }
+        } else {
+          const ids = [payload?.id, payload?.truckId, payload?.shipmentId].filter(
+            (v): v is string => typeof v === 'string',
+          );
+          if (ids.length) {
+            setFlashIds(ids);
+            setFlashTone(flashKindFor(message.type));
+            if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+            flashTimerRef.current = window.setTimeout(() => setFlashIds([]), 1600);
+          }
         }
 
         if (pendingRef.current) window.clearTimeout(pendingRef.current);
@@ -163,6 +195,7 @@ export function FleetProvider({ children }: { children: ReactNode }) {
         if (next === 'REGISTER') return;
         const login = await api.demoLogin(next);
         setSession(login);
+        sessionRef.current = login;
       } catch (err) {
         setError((err as Error).message);
       }
@@ -178,6 +211,7 @@ export function FleetProvider({ children }: { children: ReactNode }) {
       /* private mode: ignore */
     }
     setSession(account);
+    sessionRef.current = account;
     setError(null);
   }, []);
 
@@ -209,6 +243,8 @@ export function FleetProvider({ children }: { children: ReactNode }) {
     lastEvent,
     flashIds,
     flashTone,
+    toasts,
+    dismissToast,
     refresh,
     setMode,
     adoptAccount,

@@ -29,6 +29,64 @@ trucksRouter.get(
   }),
 );
 
+/**
+ * GET /drivers — the whole crew, not just whoever is signed in.
+ *
+ * The Driver screen is scoped to one driver on purpose, which left no way to see
+ * the rest of the fleet. This joins each driver to their truck, their current lane,
+ * and the load currently waiting on them, so a decline can be traced to a named
+ * person and the roster reads like a real fleet rather than a single row.
+ */
+trucksRouter.get(
+  '/drivers',
+  asyncHandler(async (_req, res) => {
+    const [drivers, trucks, users, shipments, offers] = await Promise.all([
+      db.drivers.get(),
+      db.trucks.get(),
+      db.users.get(),
+      db.shipments.get(),
+      db.capacityOffers.get(),
+    ]);
+
+    const rows = drivers.map((d) => {
+      const truck = d.assignedTruckId ? trucks.find((t) => t.id === d.assignedTruckId) ?? null : null;
+      const user = users.find((u) => u.id === d.userId) ?? null;
+      const offer = truck ? offers.find((o) => o.truckId === truck.id) ?? null : null;
+      const live = shipments.filter(
+        (s) => s.truckId === truck?.id && s.status !== 'DELIVERED' && s.status !== 'DRAFT',
+      );
+      const awaiting = live.filter((s) => s.status === 'CAPACITY_RESERVED');
+
+      return {
+        ...d,
+        userName: user?.name ?? null,
+        contact: user?.contact ?? d.phone,
+        truckId: truck?.id ?? null,
+        truckRegistrationNo: truck?.registrationNo ?? null,
+        truckStatus: truck?.status ?? null,
+        capacityT: truck?.capacityT ?? null,
+        availableT: truck?.availableT ?? null,
+        lane: truck ? `${truck.origin} → ${truck.destination}` : null,
+        departureAt: truck?.departureAt ?? null,
+        pricePerT: offer?.pricePerT ?? null,
+        activeShipments: live.length,
+        awaitingApproval: awaiting.length,
+        awaitingShipmentIds: awaiting.map((s) => s.id),
+      };
+    });
+
+    rows.sort((a, b) => (a.truckId ?? 'zzz').localeCompare(b.truckId ?? 'zzz'));
+    res.json({
+      drivers: rows,
+      counts: {
+        total: rows.length,
+        onATruck: rows.filter((r) => r.truckId).length,
+        awaitingApproval: rows.reduce((n, r) => n + r.awaitingApproval, 0),
+      },
+    });
+  }),
+);
+
 trucksRouter.get(
   '/trucks/:id',
   asyncHandler(async (req, res) => {
